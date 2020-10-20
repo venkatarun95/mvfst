@@ -97,7 +97,7 @@ void Copa::checkAndUpdateDirection(const TimePoint ackTime) {
       velocityState_.numTimesDirectionSame = 0;
     } else {
       velocityState_.numTimesDirectionSame++;
-      if (velocityState_.numTimesDirectionSame >= 3) {
+      if (velocityState_.numTimesDirectionSame >= 4) {
         velocityState_.velocity = 2 * velocityState_.velocity;
       }
     }
@@ -151,7 +151,7 @@ void Copa::onPacketAcked(const AckEvent& ack) {
       std::chrono::duration_cast<microseconds>(ack.ackTime.time_since_epoch())
           .count());
   auto rttMin = minRTTFilter_.GetBest();
-  standingRTTFilter_.SetWindowLength(conn_.lossState.srtt.count() / 2);
+  standingRTTFilter_.SetWindowLength(conn_.lossState.srtt.count());
   standingRTTFilter_.Update(
       conn_.lossState.lrtt,
       std::chrono::duration_cast<microseconds>(ack.ackTime.time_since_epoch())
@@ -163,6 +163,7 @@ void Copa::onPacketAcked(const AckEvent& ack) {
            << " writable=" << getWritableBytes() << " cwnd=" << cwndBytes_
            << " inflight=" << conn_.lossState.inflightBytes
            << " rttMin=" << rttMin.count()
+           << " rttStanding=" << rttStandingMicroSec
            << " sRTT=" << conn_.lossState.srtt.count()
            << " lRTT=" << conn_.lossState.lrtt.count()
            << " mRTT=" << conn_.lossState.mrtt.count()
@@ -179,14 +180,13 @@ void Copa::onPacketAcked(const AckEvent& ack) {
         kCongestionPacketAck);
   }
 
-  auto delayInMicroSec =
-      duration_cast<microseconds>(conn_.lossState.lrtt - rttMin).count();
-  if (delayInMicroSec < 0) {
+  if (rttStandingMicroSec < rttMin.count()) {
     LOG(ERROR) << __func__
-               << "delay negative, lrtt=" << conn_.lossState.lrtt.count()
+               << "delay negative, rttStanding=" << rttStandingMicroSec
                << " rttMin=" << rttMin.count() << " " << conn_;
     return;
   }
+  auto delayInMicroSec = rttStandingMicroSec - rttMin.count();
   if (rttStandingMicroSec == 0) {
     LOG(ERROR) << __func__ << "rttStandingMicroSec zero, lrtt = "
                << conn_.lossState.lrtt.count() << " rttMin=" << rttMin.count()
