@@ -48,6 +48,7 @@ void Copa::onRemoveBytesFromInflight(uint64_t bytes) {
 void Copa::onPacketSent(const OutstandingPacket& packet) {
   addAndCheckOverflow(
       conn_.lossState.inflightBytes, packet.metadata.encodedSize);
+  lastSentTime_ = packet.metadata.time;
 
   VLOG(10) << __func__ << " writable=" << getWritableBytes()
            << " cwnd=" << cwndBytes_
@@ -82,6 +83,12 @@ void Copa::checkAndUpdateDirection(const TimePoint ackTime) {
     return;
   }
   auto elapsed_time = ackTime - velocityState_.lastCwndRecordTime.value();
+
+  if (lossState_.loss_mode) {
+    velocityState_.velocity = 1;
+    velocityState_.numTimesDirectionSame = 0;
+    return;
+  }
 
   VLOG(10) << __func__ << " elapsed time for direction update "
            << elapsed_time.count() << ", srtt " << conn_.lossState.srtt.count()
@@ -130,6 +137,57 @@ void Copa::changeDirection(
 void Copa::onPacketAckOrLoss(
     folly::Optional<AckEvent> ack,
     folly::Optional<LossEvent> loss) {
+  folly::Optional<TimePoint> largestSentTime = folly::none;
+  // Keep track of the fraction of packets lost
+  if (ack) {
+    lossState_.num_pkts += (*ack).ackedPackets.size();
+    largestSentTime = (*ack).largestAckedPacketSentTime;
+  }
+  if (loss) {
+    lossState_.num_pkts += (*loss).lostPackets;
+    lossState_.num_lost += (*loss).lostPackets;
+    if (largestSentTime && (*loss).largestLostSentTime &&
+        *largestSentTime < *(*loss).largestLostSentTime) {
+      largestSentTime = (*loss).largestLostSentTime;
+    }
+  }
+  VLOG(10) << __func__ << " loss state"
+         << " cwndBytes_=" << cwndBytes_
+         << " num_pkts=" << lossState_.num_pkts
+         << " num_lost=" << lossState_.num_lost
+         << " " << conn_;
+
+
+  // We are done with the current interval for monitoring losses
+  if (lossState_.endOfRtt && largestSentTime &&
+      *lossState_.endOfRtt < *largestSentTime &&
+      (double)lossState_.num_pkts * lossThresh_ >= 2.) {
+    // See if we have enough losses to reduce cwnd
+    if (lossState_.num_lost >= lossThresh_ * (double)lossState_.num_pkts) {
+      lossState_.loss_mode = true;
+      isSlowStart_ = false;
+      subtractAndCheckUnderflow(
+        cwndBytes_,
+        std::min<uint64_t>(
+          conn_.udpSendPacketLen / deltaParam_,
+          cwndBytes_ -
+          conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen));
+      VLOG(10) << __func__ << " decreasing cwnd on loss"
+               << " cwndBytes_=" << cwndBytes_
+               << " num_pkts=" << lossState_.num_pkts
+               << " num_lost=" << lossState_.num_lost
+               << " " << conn_;
+    }
+    // Start monitoring the next interval for losses
+    lossState_.num_pkts = 0;
+    lossState_.num_lost = 0;
+    lossState_.endOfRtt = lastSentTime_;
+  }
+
+  if (!lossState_.endOfRtt) {
+    lossState_.endOfRtt = lastSentTime_;
+  }
+
   if (loss) {
     onPacketLoss(*loss);
     if (conn_.pacer) {
@@ -249,6 +307,7 @@ void Copa::onPacketAcked(const AckEvent& ack) {
       addAndCheckOverflow(cwndBytes_, addition);
     }
   } else {
+    lossState_.loss_mode = false;
     if (velocityState_.direction != VelocityState::Direction::Down &&
         velocityState_.velocity > 1.0) {
       // if our current rate is much different than target, we double v every
@@ -271,7 +330,12 @@ void Copa::onPacketAcked(const AckEvent& ack) {
                 conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen));
   }
   if (conn_.pacer) {
-    conn_.pacer->refreshPacingRate(cwndBytes_ * 2, conn_.lossState.srtt);
+    auto factor = 2;
+    if (lossState_.loss_mode) {
+      // Buffer is too short. Need to pace aggressively
+      factor = 1;
+    }
+    conn_.pacer->refreshPacingRate(cwndBytes_ * factor, conn_.lossState.srtt);
   }
 }
 
@@ -300,7 +364,12 @@ void Copa::onPacketLoss(const LossEvent& loss) {
     }
     cwndBytes_ = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
     if (conn_.pacer) {
-      conn_.pacer->refreshPacingRate(cwndBytes_ * 2, conn_.lossState.srtt);
+      auto factor = 2;
+      if (lossState_.loss_mode) {
+        // Buffer is too short. Need to pace aggressively
+        factor = 1;
+      }
+      conn_.pacer->refreshPacingRate(cwndBytes_ * factor, conn_.lossState.srtt);
     }
   }
 }
